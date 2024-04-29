@@ -100,6 +100,23 @@ app.get("/discounts", authenticateToken, async (req, res) => {
   }
 });
 
+app.get("/ticket", authenticateToken, async (req, res) => {
+  try {
+    const id = req.query.id;
+    const ticketDate = req.query.ticketdate;
+    let sql =
+      "SELECT a.patient_id, a.ticket_time, a.ticket_date, a.ticket_number, b.patient_name, b.phone, c.staff_name  FROM ticket AS a INNER JOIN patient As b ON a.patient_id = b.patient_id INNER JOIN staff As c on a.doctor_id = c.staff_id ";
+    if (id && ticketDate) {
+      sql += `WHERE a.patient_id=${id} AND a.ticket_date='${ticketDate}' ORDER BY a.ticket_date LIMIT 1`;
+      const [rows] = await pool.execute(sql);
+      res.json(rows);
+    }
+  } catch (error) {
+    console.error("Error fetching ticket:", error);
+    res.status(500).json({ error: "Error fetching ticket" });
+  }
+});
+
 app.get("/payments", authenticateToken, async (req, res) => {
   try {
     const id = req.query.id;
