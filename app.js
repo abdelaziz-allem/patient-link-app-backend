@@ -4,17 +4,32 @@ const PORT = process.env.PORT || 3000;
 const mysql = require("mysql2");
 const bodyParser = require("body-parser");
 const jwt = require("jsonwebtoken");
+const bcryptjs = require("bcryptjs");
+const mysql2Timeout = require("mysql2-timeout-additions");
 require("dotenv").config();
+const MAX_QUERY_EXECUTION_TIME_SECONDS = 5;
 
 app.use(bodyParser.json());
-const pool = mysql
-  .createPool({
-    host: process.env.HOST,
-    user: process.env.USER,
-    password: process.env.PASSWORD,
-    database: process.env.DATABASE,
+
+const pool = mysql.createPool({
+  host: process.env.DATABASE_HOST,
+  user: process.env.DATABASE_USER,
+  password: process.env.DATABASE_PASSWORD,
+  database: process.env.DATABASE_NAME,
+  connectionLimit: 10,
+  waitForConnections: true,
+});
+const promisePool = pool.promise();
+
+promisePool
+  .getConnection()
+  .then((connection) => {
+    console.log("Connected to MySQL database!");
+    connection.release();
   })
-  .promise();
+  .catch((err) => {
+    console.error("Error connecting to MySQL database:", err);
+  });
 
 const secretKey = process.env.JWT_SECRET;
 if (!secretKey) {
@@ -34,18 +49,25 @@ const authenticateToken = (req, res, next) => {
 };
 
 app.get("/api/protected", authenticateToken, (req, res) => {
-  res.json({ message: "Access denied" });
+  res.json({ message: "Access granted" });
 });
 
 app.get("/appointments", authenticateToken, async (req, res) => {
   try {
     const id = req.query.id;
     let sql =
-      "SELECT a.appointment_id,a.app_reason,a.appointment_time,a.appointment_date,b.patient_name,c.staff_name FROM appointment AS a INNER JOIN patient AS b ON a.patient_id=b.patient_id INNER JOIN staff AS c ON a.doctor_id = c.staff_id";
+      "SELECT a.status, a.appointment_id, a.app_reason, a.appointment_time, a.appointment_date, b.patient_name, c.staff_name " +
+      "FROM appointment AS a " +
+      "INNER JOIN patient AS b ON a.patient_id = b.patient_id " +
+      "INNER JOIN staff AS c ON a.doctor_id = c.staff_id";
+
+    const params = [];
     if (id) {
-      sql += ` WHERE a.patient_id = ${id} ORDER BY a.appointment_date DESC`;
+      sql += " WHERE a.patient_id = ? ORDER BY a.appointment_date DESC";
+      params.push(id);
     }
-    const [rows] = await pool.execute(sql);
+
+    const [rows] = await promisePool.execute(sql, params);
     res.json(rows);
   } catch (error) {
     console.error("Error fetching appointments:", error);
@@ -57,11 +79,18 @@ app.get("/latestappointments", authenticateToken, async (req, res) => {
   try {
     const id = req.query.id;
     let sql =
-      "SELECT a.appointment_id,a.app_reason,a.appointment_time,a.appointment_date,b.patient_name,c.staff_name FROM appointment AS a INNER JOIN patient AS b ON a.patient_id=b.patient_id INNER JOIN staff AS c ON a.doctor_id = c.staff_id";
+      "SELECT a.appointment_id, a.app_reason, a.appointment_time, a.appointment_date, b.patient_name, c.staff_name " +
+      "FROM appointment AS a " +
+      "INNER JOIN patient AS b ON a.patient_id = b.patient_id " +
+      "INNER JOIN staff AS c ON a.doctor_id = c.staff_id";
+
+    const params = [];
     if (id) {
-      sql += ` WHERE a.patient_id = ${id} ORDER BY a.appointment_date DESC LIMIT 2`;
+      sql += " WHERE a.patient_id = ? ORDER BY a.appointment_date DESC LIMIT 2";
+      params.push(id);
     }
-    const [rows] = await pool.execute(sql);
+
+    const [rows] = await promisePool.execute(sql, params);
     res.json(rows);
   } catch (error) {
     console.error("Error fetching appointments:", error);
@@ -73,11 +102,17 @@ app.get("/bills", authenticateToken, async (req, res) => {
   try {
     const id = req.query.id;
     let sql =
-      "SELECT appointment_id, SUM(CASE WHEN type = 'prescription' THEN bill_amount ELSE 0 END) AS prescription_sum, SUM(CASE WHEN type = 'treatment' THEN bill_amount ELSE 0 END) AS treatment_sum FROM bill ";
+      "SELECT SUM(CASE WHEN type = 'prescription' THEN bill_amount ELSE 0 END) AS prescription_sum, " +
+      "SUM(CASE WHEN type = 'treatment' THEN bill_amount ELSE 0 END) AS treatment_sum " +
+      "FROM bill WHERE (type = 'prescription' OR type = 'treatment')";
+
+    const params = [];
     if (id) {
-      sql += `WHERE patient_id=${id} AND (type = 'prescription' OR type = 'treatment') GROUP BY appointment_id`;
+      sql += " AND patient_id = ?";
+      params.push(id);
     }
-    const [rows] = await pool.execute(sql);
+
+    const [rows] = await promisePool.execute(sql, params);
     res.json(rows);
   } catch (error) {
     console.error("Error fetching bills:", error);
@@ -85,32 +120,23 @@ app.get("/bills", authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/discounts", authenticateToken, async (req, res) => {
-  try {
-    const id = req.query.id;
-    let sql = "SELECT SUM(discount_amount) AS discount_sum FROM discount ";
-    if (id) {
-      sql += `WHERE patient_id=${id}`;
-      const [rows] = await pool.execute(sql);
-      res.json(rows);
-    }
-  } catch (error) {
-    console.error("Error fetching discounts:", error);
-    res.status(500).json({ error: "Error fetching discounts" });
-  }
-});
-
 app.get("/ticket", authenticateToken, async (req, res) => {
   try {
     const id = req.query.id;
-    const ticketDate = req.query.ticketdate;
     let sql =
-      "SELECT a.patient_id, a.ticket_time, a.ticket_date, a.ticket_number, b.patient_name, b.phone, c.staff_name  FROM ticket AS a INNER JOIN patient As b ON a.patient_id = b.patient_id INNER JOIN staff As c on a.doctor_id = c.staff_id ";
-    if (id && ticketDate) {
-      sql += `WHERE a.patient_id=${id} AND a.ticket_date='${ticketDate}' ORDER BY a.ticket_date LIMIT 1`;
-      const [rows] = await pool.execute(sql);
-      res.json(rows);
+      "SELECT a.patient_id, a.ticket_date, a.ticket_time, a.ticket_number, b.patient_name, b.phone, c.staff_name " +
+      "FROM ticket AS a " +
+      "INNER JOIN patient AS b ON a.patient_id = b.patient_id " +
+      "INNER JOIN staff AS c ON a.doctor_id = c.staff_id";
+
+    const params = [];
+    if (id) {
+      sql += " WHERE a.patient_id = ? ORDER BY a.ticket_id LIMIT 1";
+      params.push(id);
     }
+
+    const [rows] = await promisePool.execute(sql, params);
+    res.json(rows);
   } catch (error) {
     console.error("Error fetching ticket:", error);
     res.status(500).json({ error: "Error fetching ticket" });
@@ -120,11 +146,15 @@ app.get("/ticket", authenticateToken, async (req, res) => {
 app.get("/payments", authenticateToken, async (req, res) => {
   try {
     const id = req.query.id;
-    let sql = "SELECT SUM(paid_amount) AS paid_sum FROM payment ";
+    let sql = "SELECT SUM(paid_amount) AS paid_sum FROM payment WHERE 1=1";
+
+    const params = [];
     if (id) {
-      sql += `WHERE patient_id=${id}`;
+      sql += " AND patient_id = ?";
+      params.push(id);
     }
-    const [rows] = await pool.execute(sql);
+
+    const [rows] = await promisePool.execute(sql, params);
     res.json(rows);
   } catch (error) {
     console.error("Error fetching payments:", error);
@@ -134,22 +164,34 @@ app.get("/payments", authenticateToken, async (req, res) => {
 
 app.post("/api/login", async (req, res) => {
   try {
-    const userData = req.body;
-    let sql = "SELECT * FROM patient";
-    if (userData) {
-      sql += ` WHERE phone = '${userData.phoneNumber}' AND password = '${userData.password}'  `;
-    }
-    const [rows] = await pool.execute(sql);
+    const { phoneNumber, password } = req.body;
 
-    if (rows.length !== 0) {
-      const token = jwt.sign({ userId: rows[0].id }, secretKey);
-      res.json({ isAuthenticated: true, data: rows, JWTtoken: token });
+    const [rows] = await promisePool.execute(
+      "SELECT * FROM patient WHERE phone = ?",
+      [phoneNumber]
+    );
+
+    if (rows.length === 0) {
+      return res
+        .status(401)
+        .json({ isAuthenticated: false, message: "User not found" });
+    }
+
+    const user = rows[0];
+
+    const isMatch = await bcryptjs.compare(password, user.password);
+
+    if (isMatch) {
+      const token = jwt.sign({ userId: user.patient_id }, secretKey);
+      res.json({ isAuthenticated: true, data: user, JWTtoken: token });
     } else {
-      res.json({ isAuthenticated: false, data: [] });
+      res
+        .status(401)
+        .json({ isAuthenticated: false, message: "Invalid credentials" });
     }
   } catch (error) {
-    console.error("Error fetching patient:", error);
-    res.status(500).json({ error: "Error fetching patient" });
+    console.error("Error logging in:", error);
+    res.status(500).json({ error: "Error logging in" });
   }
 });
 
